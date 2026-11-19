@@ -1,0 +1,10 @@
+# Used when you run "streamlit run app.py" from this folder.
+# The launchers (FP-Match.command / FP-Match.bat / packaged app) pass the same settings.
+[server]
+address = "localhost"          # do not expose fingerprints on the network
+
+[browser]
+gatherUsageStats = false       # no telemetry
+
+[client]
+toolbarMode = "minimal"

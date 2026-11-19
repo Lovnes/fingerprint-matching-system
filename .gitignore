@@ -1,0 +1,9 @@
+.venv/
+.build-venv/
+build/
+dist/
+data/
+__pycache__/
+*.pyc
+.DS_Store
+fingerprint-matching-system/

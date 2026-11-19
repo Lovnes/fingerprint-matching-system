@@ -1,0 +1,46 @@
+# Builds the standalone Mac and Windows apps. Run it from the Actions tab, or push a tag like v1.0.0.
+# Download the zips from the run's "Artifacts" section (tags also attach them to a GitHub release).
+name: Build apps
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            script: packaging\build_windows.bat
+            zip: dist/FP-Match-Windows.zip
+          - os: macos-latest        # Apple silicon (arm64)
+            script: packaging/build_mac.sh
+            zip: dist/FP-Match-macOS-arm64.zip
+          - os: macos-15-intel      # Intel Macs (x86_64)
+            script: packaging/build_mac.sh
+            zip: dist/FP-Match-macOS-x86_64.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build
+        shell: bash
+        run: |
+          export PYTHON=python
+          if [ "$RUNNER_OS" = "Windows" ]; then cmd //c "${{ matrix.script }}"; else bash ${{ matrix.script }}; fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.os }}
+          path: ${{ matrix.zip }}
+      - if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.zip }}
