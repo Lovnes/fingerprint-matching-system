@@ -98,7 +98,13 @@ class PrintDB:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         self.con = sqlite3.connect(path, check_same_thread=False)
         self.con.executescript(SCHEMA)
+        cols = {r[1] for r in self.con.execute("PRAGMA table_info(prints)")}
+        for col in ("enhanced", "mask"):          # ML stage (added in 1.1); older rows are filled on demand
+            if col not in cols:
+                self.con.execute(f"ALTER TABLE prints ADD COLUMN {col} BLOB")
+        self.con.commit()
         self._cache = None
+        self._ml_cache = {}
 
     # ------------------------------------------------------------------ audit
     def log(self, action: str, user: str = "", **detail):
@@ -114,12 +120,14 @@ class PrintDB:
     def enroll(self, processed, subject_id: str, name: str = "", finger: str = "Unknown",
                source_file: str = "", ppi: int = 500, notes: str = "", user: str = ""):
         thumb = cv2.imencode(".png", _thumb(processed.enh.gray))[1].tobytes()
+        enh = cv2.imencode(".png", processed.enh.enhanced)[1].tobytes()
+        mask = cv2.imencode(".png", processed.enh.mask.astype(np.uint8) * 255)[1].tobytes()
         try:
             cur = self.con.execute(
                 "INSERT INTO prints(subject_id,name,finger,source_file,sha256,ppi,n_minutiae,quality,"
-                "template,thumbnail,notes,enrolled_at,enrolled_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "template,thumbnail,notes,enrolled_at,enrolled_by,enhanced,mask) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (subject_id, name, finger, source_file, processed.sha256, ppi, processed.n,
-                 processed.quality, _arr_to_blob(processed.template), thumb, notes, now(), user))
+                 processed.quality, _arr_to_blob(processed.template), thumb, notes, now(), user, enh, mask))
         except sqlite3.IntegrityError:
             return None  # same image already enrolled for this subject/finger
         self.con.commit()
@@ -133,6 +141,7 @@ class PrintDB:
         self.con.execute("DELETE FROM prints WHERE id=?", (print_id,))
         self.con.commit()
         self._cache = None
+        self._ml_cache.pop(print_id, None)
         if row:
             self.log("delete", user, print_id=print_id, subject_id=row[0], sha256=row[1])
 
@@ -161,6 +170,28 @@ class PrintDB:
             return None
         return cv2.imdecode(np.frombuffer(r[0], np.uint8), cv2.IMREAD_GRAYSCALE)
 
+    def ml_arrays(self, print_id: int):
+        """(enhanced uint8, mask bool) of a reference print for the ML stage."""
+        if print_id in self._ml_cache:
+            return self._ml_cache[print_id]
+        r = self.con.execute("SELECT enhanced, mask FROM prints WHERE id=?", (print_id,)).fetchone()
+        if r is None:
+            return None
+        if r[0] is None or r[1] is None:      # enrolled before 1.1: rebuild from the stored 500 ppi image
+            from .enhance import EnhanceParams, enhance
+            e = enhance(self.thumbnail(print_id), EnhanceParams())
+            enh_png = cv2.imencode(".png", e.enhanced)[1].tobytes()
+            mask_png = cv2.imencode(".png", e.mask.astype(np.uint8) * 255)[1].tobytes()
+            self.con.execute("UPDATE prints SET enhanced=?, mask=? WHERE id=?", (enh_png, mask_png, print_id))
+            self.con.commit()
+            r = (enh_png, mask_png)
+        enh = cv2.imdecode(np.frombuffer(r[0], np.uint8), cv2.IMREAD_GRAYSCALE)
+        mask = cv2.imdecode(np.frombuffer(r[1], np.uint8), cv2.IMREAD_GRAYSCALE) > 127
+        if len(self._ml_cache) > 300:
+            self._ml_cache.pop(next(iter(self._ml_cache)))
+        self._ml_cache[print_id] = (enh, mask)
+        return enh, mask
+
     # ---------------------------------------------------------------- search
     def _templates(self):
         if self._cache is None:
@@ -172,7 +203,10 @@ class PrintDB:
         return self._cache
 
     def search(self, query_template: np.ndarray, top_k: int = 10, finger: str | None = None,
-               progress=None) -> list[dict]:
+               progress=None, query_ml=None, verifier=None, ml_candidates: int = 200) -> list[dict]:
+        """Minutiae search over every reference, then (if a verifier and the query's (enhanced, mask) are
+        given) ML re-scoring of the best `ml_candidates` (all of them for databases up to 500 prints).
+        Hits carry 'result' (MatchResult) and, when scored, 'ml' ({ml, cnn, overlap})."""
         entries = self._templates()
         if finger and finger != "Unknown":
             entries = [e for e in entries if e[3] in (finger, "Unknown")]
@@ -189,6 +223,13 @@ class PrintDB:
                 if progress and k % 25 == 0:
                     progress((k + 1) / max(len(entries), 1))
         results.sort(key=lambda d: (d["result"].score, d["result"].n_supported), reverse=True)
+        if verifier is not None and verifier.available and query_ml is not None and results:
+            n = len(results) if len(results) <= 500 else ml_candidates
+            cand = results[:n]
+            pairs = [(query_ml[0], query_ml[1], *self.ml_arrays(h["print_id"]), h["result"]) for h in cand]
+            for h, s in zip(cand, verifier.score(pairs)):
+                h["ml"] = s
+            results = sorted(cand, key=lambda d: (d["ml"]["ml"], d["result"].score), reverse=True) + results[n:]
         return results[:top_k]
 
 

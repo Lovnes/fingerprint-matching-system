@@ -10,6 +10,7 @@ Everything runs offline on your own machine. No print leaves the computer.
 | | |
 |---|---|
 | **Sample vs Suspect** | Two slots side by side: the sample (scene/exhibit) print and the suspect's print, with a score, supported/paired minutiae and a side-by-side chart of the paired minutiae |
+| **ML verifier** | A neural network compares the ridge images of both prints after alignment; a learned fusion with the minutiae evidence gives the **ML match score** that decides the indication. Runs offline through OpenCV (no GPU, no PyTorch needed) |
 | **1:N search** | Search one print against the whole reference database and get ranked candidates. Can be limited to one finger position |
 | **Latent mode** | Background flattening, CLAHE, non-local-means denoising, stronger orientation smoothing and stricter quality filters |
 | **Image controls** | Resolution (ppi) correction, invert for light ridges, crop to region of interest |
@@ -106,8 +107,16 @@ image -> resample to 500 ppi -> [latent: flatten + CLAHE + denoise] -> normalise
 template A, template B
       -> local structure of each minutia (6 nearest neighbours; rotation/translation invariant)
       -> candidate pairs -> align on each candidate -> one-to-one pairing (12 px, 20°)
-      -> least-squares refinement -> weight pairs by neighbourhood agreement -> score
+      -> least-squares refinement -> weight pairs by neighbourhood agreement -> minutiae score
+ML stage (fpmatch/ml.py)
+      -> warp the query onto the reference with the matcher's alignment
+      -> 192 px window around the overlap: [query ridges, reference ridges, overlap mask] -> 96x96
+      -> CNN (7 conv layers, 443k parameters, fpmatch/models/verifier.onnx) -> ridge-agreement logit
+      -> logistic-regression fusion with minutiae score / supported / paired / overlap -> ML score 0-100
 ```
+
+In a 1:N search every reference is scored by the minutiae matcher; the ML stage then re-scores all of them
+(databases up to 500 prints) or the best 200, and the list is ranked by ML score.
 
 Code layout:
 
@@ -116,6 +125,9 @@ Code layout:
 | `fpmatch/enhance.py` | Segmentation, orientation, frequency, Gabor enhancement, thinning |
 | `fpmatch/minutiae.py` | Minutiae extraction and false-minutiae removal |
 | `fpmatch/matcher.py` | Matcher, score, decision bands |
+| `fpmatch/ml.py` | ML verifier: pair input, OpenCV inference, fusion, ML bands |
+| `fpmatch/models/` | Trained model (`verifier.onnx`) and its card (`verifier.json`: training data, fusion weights, thresholds, test results, SHA-256) |
+| `training/` | Dataset builder and training script (PyTorch) |
 | `fpmatch/database.py` | SQLite reference store, parallel 1:N search, audit log |
 | `fpmatch/report.py` | HTML report |
 | `fpmatch/synth.py` | Synthetic fingerprint generator for testing |
@@ -127,14 +139,44 @@ Code layout:
 
 ## Reading the result
 
-* **Score** (0-100): the share of the overlapping area that agrees, weighted by neighbourhood agreement.
+* **ML match score** (0-100): decides the indication when the model is loaded (sidebar shows "ML verifier active").
+  The bands are stored in `fpmatch/models/verifier.json` and shown on the Help page. It is a similarity score,
+  not a probability of identity.
+* **Minutiae score** (0-100): the share of the overlapping area that agrees, weighted by neighbourhood agreement.
 * **Supported pairs**: paired minutiae whose neighbourhoods also agree. Treat these as the corresponding points.
-* 🟢 *Strong candidate*: score ≥ 25 and ≥ 7 supported. 🟠 *Possible*: score ≥ 15 or ≥ 7 supported.
-  ⚪ *Not supported*: below both.
+* Without the model (files missing), the minutiae bands are used: 🟢 *Strong candidate*: score ≥ 25 and ≥ 7
+  supported. 🟠 *Possible*: score ≥ 15 or ≥ 7 supported. ⚪ *Not supported*: below both.
 
-## Measured accuracy (synthetic test set, 40 fingers)
+## Re-training the ML model
 
-See `VALIDATION.md` for the full numbers. **Run `evaluate.py` on real data before relying on the thresholds:**
+The shipped model was trained on **synthetic** prints only (see `VALIDATION.md`). Re-train it on real prints
+before operational use. Files must be named `<subject>_<impression>`; impressions starting with `L` are latents.
+Use different subjects for the three sets.
+
+```bash
+pip install -r training/requirements-train.txt
+python training/build_dataset.py --folder /data/train --out training/work/train.npz
+python training/build_dataset.py --folder /data/val   --out training/work/val.npz
+python training/build_dataset.py --folder /data/test  --out training/work/test.npz
+python training/train.py --train training/work/train.npz --val training/work/val.npz \
+                         --test training/work/test.npz --out fpmatch/models
+python evaluate.py /data/test                     # minutiae-only vs ML, side by side
+```
+
+Synthetic data instead: `--synthetic 800 --seed-base 200000` (train), `--synthetic 200 --seed-base 300000` (val),
+`--synthetic 200 --seed-base 400000` (test). Then rebuild the apps so they ship the new model.
+
+## Measured accuracy (synthetic prints)
+
+Held-out test set of 200 synthetic fingers the model never saw (full numbers in `VALIDATION.md`):
+
+| | Minutiae only | With ML verifier |
+|---|---|---|
+| Plain prints: same finger rated "Strong" | 88.3 % | **98.2 %** |
+| Latent prints: same finger rated "Strong" | 32.8 % | **85.7 %** |
+| Different fingers rated "Strong" (hardest impostors) | 0 % | 0 % |
+
+**Run `evaluate.py` on real data before relying on the thresholds** (it prints both methods side by side):
 
 ```bash
 python evaluate.py /path/to/FVC2002/DB1_B            # files named <subject>_<impression>.tif
@@ -145,8 +187,9 @@ Files named like `S003_L1.png` are treated as latent queries for a rank-1/5/10 t
 
 ## Limitations
 
-* The algorithm is a classic minutiae matcher, not a commercial AFIS. Expect lower accuracy on very poor latents
-  (fewer than about 12 minutiae).
+* **The ML model was trained and tested on synthetic prints only.** Real prints differ (sensors, skin, surfaces,
+  development techniques). Re-train it on real data (see *Re-training the ML model*) before operational use.
+* Prints that cannot be aligned (very poor latents, roughly fewer than 5 minutiae) get no ML judgement.
 * The bands were calibrated on synthetic prints. Re-calibrate them on real prints from your lab.
 * Minutiae cannot be edited by hand yet. An examiner-marked latent would give much better results on hard cases.
 * WSQ images are not read directly. Convert them to PNG first (e.g. NBIS `dwsq`).

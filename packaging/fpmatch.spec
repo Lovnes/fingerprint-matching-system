@@ -14,7 +14,8 @@ VERSION = re.search(r'__version__ = "(.+?)"', open(os.path.join(ROOT, "fpmatch",
 # Streamlit runs app.py as a script, so it ships as a data file. Its imports are not seen by
 # PyInstaller's analysis and are listed as hidden imports instead.
 datas = [(os.path.join(ROOT, "app.py"), "."),
-         (os.path.join(ROOT, "samples"), "samples")]
+         (os.path.join(ROOT, "samples"), "samples"),
+         (os.path.join(ROOT, "fpmatch", "models"), os.path.join("fpmatch", "models"))]  # ML verifier
 datas += collect_data_files("streamlit")
 datas += copy_metadata("streamlit")
 FPMATCH_MODULES = ["fpmatch." + f[:-3] for f in sorted(os.listdir(os.path.join(ROOT, "fpmatch")))
@@ -27,7 +28,7 @@ a = Analysis(
     pathex=[ROOT],
     datas=datas,
     hiddenimports=hiddenimports,
-    excludes=["tkinter", "IPython", "pytest", "matplotlib"],
+    excludes=["tkinter", "IPython", "pytest", "matplotlib", "torch", "onnx"],  # training-only
     noarchive=False,
 )
 pyz = PYZ(a.pure)

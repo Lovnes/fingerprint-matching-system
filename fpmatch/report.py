@@ -39,6 +39,7 @@ def build(case: dict, mode: str, query: dict, settings: dict, results: list[dict
     results: dicts with label, sha256/subject, score, paired, supported, verdict, colour, image(bgr, optional)
     """
     e = lambda s: html.escape(str(s or ""))
+    has_ml = any(r.get("ml") is not None for r in results)
     parts = [f"<!doctype html><html><head><meta charset='utf-8'><title>Fingerprint report {e(case.get('case_no'))}</title>"
              f"<style>{CSS}</style></head><body>",
              f"<h1>Fingerprint Comparison Report</h1><div class='small'>Generated {now()} UTC by FP-Match v{__version__} "
@@ -53,9 +54,11 @@ def build(case: dict, mode: str, query: dict, settings: dict, results: list[dict
              "<h2>Processing settings</h2>",
              _kv([(k, html.escape(str(v))) for k, v in settings.items()]),
              "<h2>Results</h2>",
-             f"<table><tr><th>#</th><th>{e(ref_title)}</th><th>Score</th><th>Paired</th><th>Supported</th><th>Indication</th></tr>"]
+             f"<table><tr><th>#</th><th>{e(ref_title)}</th>" + ("<th>ML score</th>" if has_ml else "")
+             + "<th>Minutiae score</th><th>Paired</th><th>Supported</th><th>Indication</th></tr>"]
     for k, r in enumerate(results, 1):
-        parts.append(f"<tr><td>{k}</td><td>{e(r['label'])}<div class='mono'>{e(r.get('sha256', ''))}</div></td>"
+        ml = f"<td>{r['ml']:.1f}</td>" if has_ml and r.get("ml") is not None else "<td>-</td>" if has_ml else ""
+        parts.append(f"<tr><td>{k}</td><td>{e(r['label'])}<div class='mono'>{e(r.get('sha256', ''))}</div></td>{ml}"
                      f"<td>{r['score']:.1f}</td><td>{r['paired']}</td><td>{r['supported']}</td>"
                      f"<td class='v-{r['colour']}'>{e(r['verdict'])}</td></tr>")
     parts.append("</table>")
@@ -72,5 +75,8 @@ def build(case: dict, mode: str, query: dict, settings: dict, results: list[dict
         "candidates. Scores are similarity measures, not probabilities, and are not an identification. Any "
         "candidate must be examined by a qualified fingerprint examiner following ACE-V (Analysis, Comparison, "
         "Evaluation, Verification) before an opinion is given. SHA-256 hashes above identify the exact files "
-        "analysed; source files were not modified.</div></body></html>")
+        "analysed; source files were not modified."
+        + (" The ML score comes from a neural network plus learned fusion whose model file is identified by its "
+           "SHA-256 under Processing settings; it is a similarity score, not a probability of identity." if has_ml else "")
+        + "</div></body></html>")
     return "".join(parts)

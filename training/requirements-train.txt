@@ -1,0 +1,4 @@
+# Only needed to (re)train the ML verifier. The app itself runs the model with OpenCV.
+-r ../requirements.txt
+torch>=2.2
+onnx>=1.15

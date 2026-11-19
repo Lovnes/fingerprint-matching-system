@@ -1,0 +1,136 @@
+{
+  "name": "FP-Match pair verifier",
+  "version": "1.0",
+  "app_version": "1.0.0",
+  "created_utc": "2026-11-19T05:51:48+00:00",
+  "onnx_sha256": "8f490fa00baef5d1d43b5344138733e2ceda1c9bb52009b4bbfe0531b230a0c6",
+  "architecture": "CNN, 7 conv layers (32-64-128 ch) + 2 FC, 443k parameters, input 3x96x96 (aligned query ridges, reference ridges, overlap mask; 192 px window at 500 ppi)",
+  "training": {
+    "train": "synthetic:800@200000",
+    "val": "synthetic:200@300000",
+    "test": "synthetic:200@400000",
+    "train_pairs": 25600,
+    "val_pairs": 6400,
+    "test_pairs": 6400,
+    "epochs": 8,
+    "best_val_auc": 0.9985,
+    "device": "mps",
+    "torch": "2.8.0"
+  },
+  "fusion": {
+    "features": [
+      "minutiae_score",
+      "supported",
+      "cnn_logit",
+      "overlap"
+    ],
+    "mean": [
+      0.15993832051753998,
+      0.517425537109375,
+      0.06358153373003006,
+      0.8553757667541504
+    ],
+    "std": [
+      0.16406132280826569,
+      0.797073245048523,
+      7.875374794006348,
+      0.15313558280467987
+    ],
+    "coef": [
+      0.0,
+      3.764506377464813,
+      13.435498031504613,
+      0.556323240174268
+    ],
+    "bias": 4.330134315118059
+  },
+  "thresholds": {
+    "strong": 0.3553658472771029,
+    "possible": 0.10390988980401378,
+    "rule": "strong: above every validation impostor AND network logit > 0; possible: 99th pct of validation impostors (hard impostors: the 3 best-scoring of 40 random other fingers per query); pairs without a usable overlap are not assessed (score 0)"
+  },
+  "test_metrics": {
+    "all": {
+      "auc": {
+        "minutiae": 0.8715,
+        "cnn": 0.9459,
+        "fused": 0.9409
+      },
+      "eer_pct": {
+        "minutiae": 16.89,
+        "fused": 6.78
+      },
+      "bands_minutiae_only": {
+        "genuine": 2400,
+        "impostor": 4000,
+        "strong_genuine_pct": 60.5,
+        "flagged_genuine_pct": 76.8,
+        "strong_impostor_pct": 0.0,
+        "flagged_impostor_pct": 0.45
+      },
+      "bands_ml": {
+        "genuine": 2400,
+        "impostor": 4000,
+        "strong_genuine_pct": 91.9,
+        "flagged_genuine_pct": 92.9,
+        "strong_impostor_pct": 0.0,
+        "flagged_impostor_pct": 0.675
+      }
+    },
+    "plain_queries": {
+      "auc": {
+        "minutiae": 0.9723,
+        "cnn": 0.9859,
+        "fused": 0.9839
+      },
+      "eer_pct": {
+        "minutiae": 3.67,
+        "fused": 1.67
+      },
+      "bands_minutiae_only": {
+        "genuine": 1200,
+        "impostor": 2400,
+        "strong_genuine_pct": 88.3,
+        "flagged_genuine_pct": 94.6,
+        "strong_impostor_pct": 0.0,
+        "flagged_impostor_pct": 0.125
+      },
+      "bands_ml": {
+        "genuine": 1200,
+        "impostor": 2400,
+        "strong_genuine_pct": 98.2,
+        "flagged_genuine_pct": 98.3,
+        "strong_impostor_pct": 0.0,
+        "flagged_impostor_pct": 0.042
+      }
+    },
+    "latent_queries": {
+      "auc": {
+        "minutiae": 0.7907,
+        "cnn": 0.8978,
+        "fused": 0.8975
+      },
+      "eer_pct": {
+        "minutiae": 27.93,
+        "fused": 12.32
+      },
+      "bands_minutiae_only": {
+        "genuine": 1200,
+        "impostor": 1600,
+        "strong_genuine_pct": 32.8,
+        "flagged_genuine_pct": 59.1,
+        "strong_impostor_pct": 0.0,
+        "flagged_impostor_pct": 0.938
+      },
+      "bands_ml": {
+        "genuine": 1200,
+        "impostor": 1600,
+        "strong_genuine_pct": 85.7,
+        "flagged_genuine_pct": 87.4,
+        "strong_impostor_pct": 0.0,
+        "flagged_impostor_pct": 1.625
+      }
+    }
+  },
+  "caveat": "Trained and tested on synthetic fingerprints only. Re-train / re-validate on real prints (training/build_dataset.py --folder) before operational use."
+}

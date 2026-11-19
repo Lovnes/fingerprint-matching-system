@@ -18,6 +18,7 @@ from fpmatch import __version__
 from fpmatch.database import FINGERS, PrintDB, default_db_path
 from fpmatch.enhance import EnhanceParams, load_image
 from fpmatch.matcher import match, verdict
+from fpmatch.ml import Verifier
 from fpmatch.pipeline import draw_match, draw_match_arrays, draw_minutiae, draw_template, process, sha256_bytes
 from fpmatch import report
 
@@ -34,6 +35,14 @@ def clean_folder(text: str) -> str:
     if folder and not os.path.isabs(folder) and not os.path.isdir(folder):
         folder = os.path.join(APP_DIR, folder)
     return folder
+
+
+@st.cache_resource
+def get_verifier():
+    return Verifier()
+
+
+VERIFIER = get_verifier()
 
 
 @st.cache_resource
@@ -69,6 +78,10 @@ with st.sidebar:
     db_path = st.text_input("Database file", value=default_db_path())
     db = get_db(db_path)
     st.caption(f"{db.count()} reference prints enrolled")
+    if VERIFIER.available:
+        st.caption(f"🧠 ML verifier {VERIFIER.meta['version']} active")
+    else:
+        st.warning(f"ML model not loaded - using minutiae only. ({VERIFIER.error})")
     if os.environ.get("FPMATCH_LAUNCHER"):  # started from the desktop launcher / packaged app
         st.divider()
         if st.button("⏻ Quit FP-Match", help="Stops the local server. Your database is kept."):
@@ -129,16 +142,46 @@ def show_stages(p, width="stretch"):
         c[3].image((~p.skeleton * 255).astype(np.uint8), caption="Thinned ridges", width=width)
 
 
-def verdict_box(res):
-    label, colour = verdict(res)
+def judge(res, ml=None):
+    """(label, colour): the ML verdict when the model ran, else the minutiae-only verdict."""
+    if ml is not None and VERIFIER.available:
+        return VERIFIER.verdict(ml)
+    return verdict(res)
+
+
+def verdict_box(res, ml=None):
+    label, colour = judge(res, ml)
     fn = {"green": st.success, "orange": st.warning, "gray": st.info}[colour]
-    fn(f"**{label}** — score {res.score:.1f}/100 · {res.n_supported} supported of {res.n_paired} paired minutiae")
+    head = f"ML match score {ml['ml']:.1f}/100 · minutiae score {res.score:.1f}" if ml else f"score {res.score:.1f}/100"
+    if ml and not ml["assessed"]:
+        head = f"the prints could not be aligned with enough overlap for the ML stage · minutiae score {res.score:.1f}"
+    fn(f"**{label}** — {head} · {res.n_supported} supported of {res.n_paired} paired minutiae")
+
+
+def ml_explainer(ml):
+    if not ml["assessed"]:
+        st.caption("ML stage: no usable alignment/overlap between the prints, so the network could not compare "
+                   "ridges. Try latent mode, crop or invert on the sample, or a better image.")
+        return
+    with st.expander("How the ML score was computed"):
+        st.markdown(
+            f"""1. The minutiae matcher aligned the two prints (rotation and shift).
+2. A neural network compared the **ridge images inside the overlapping area**. Its output: **{ml['cnn']:+.2f}**
+   (above 0 = ridges agree, below 0 = they do not; the overlap covers {100 * ml['overlap']:.0f}% of the smaller print).
+3. A learned fusion combined the network output with the minutiae evidence into the ML match score
+   **{ml['ml']:.1f}/100**. Bands: strong ≥ {100 * VERIFIER.t_strong:.1f} *and* network output above 0,
+   possible ≥ {100 * VERIFIER.t_possible:.1f}.
+
+Model: {VERIFIER.label} · ONNX SHA-256 `{VERIFIER.sha256[:16]}…` · {VERIFIER.meta.get('caveat', '')}""")
 
 
 def settings_dict(opts):
-    return {"Latent mode": opts["latent"], "Inverted": opts["invert"], "Input resolution (ppi)": opts["ppi"],
-            "Crop (x0,y0,x1,y1 %)": opts["crop"], "Pairing tolerance": "12 px, 20°",
-            "Software": f"FP-Match v{__version__}"}
+    d = {"Latent mode": opts["latent"], "Inverted": opts["invert"], "Input resolution (ppi)": opts["ppi"],
+         "Crop (x0,y0,x1,y1 %)": opts["crop"], "Pairing tolerance": "12 px, 20°",
+         "Software": f"FP-Match v{__version__}"}
+    if VERIFIER.available:
+        d["ML model"] = f"{VERIFIER.label}, ONNX SHA-256 {VERIFIER.sha256}"
+    return d
 
 
 # ---------------------------------------------------------------------------- 1:1
@@ -173,30 +216,38 @@ if page == "Sample vs Suspect":
             st.info("Upload the suspect's fingerprint here.")
     if pq and pr:
         res = match(pq.template, pr.template, pq.local, pr.local)
+        ml = (VERIFIER.score([(pq.enh.enhanced, pq.enh.mask, pr.enh.enhanced, pr.enh.mask, res)])[0]
+              if VERIFIER.available else None)
         st.subheader("Result")
-        verdict_box(res)
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Score", f"{res.score:.1f}")
+        verdict_box(res, ml)
+        m0, m1, m2, m3, m4 = st.columns(5)
+        m0.metric("ML match score", f"{ml['ml']:.1f}" if ml else "n/a")
+        m1.metric("Minutiae score", f"{res.score:.1f}")
         m2.metric("Supported pairs", res.n_supported)
         m3.metric("Paired minutiae", res.n_paired)
         m4.metric("Rotation", f"{res.rotation_deg:.0f}°")
+        if ml:
+            ml_explainer(ml)
         canvas = draw_match(pq, pr, res)
         st.image(canvas, channels="BGR", width="stretch",
                  caption="Left: sample · Right: suspect · Green = supported pair, yellow = positional pair only")
         db.log("compare_1to1", case["examiner"], case_no=case["case_no"], query=fq.name, query_sha256=pq.sha256,
                reference=fr.name, reference_sha256=pr.sha256, suspect=suspect, score=round(res.score, 1),
-               supported=res.n_supported, paired=res.n_paired)
-        label, colour = verdict(res)
+               supported=res.n_supported, paired=res.n_paired, ml_score=round(ml["ml"], 1) if ml else None)
+        label, colour = judge(res, ml)
         settings = {f"Sample - {k}": v for k, v in settings_dict(oq).items() if k != "Software"}
         settings.update({f"Suspect - {k}": v for k, v in settings_dict(orf).items() if k not in ("Software", "Pairing tolerance")})
         settings["Software"] = f"FP-Match v{__version__}"
+        if VERIFIER.available:
+            settings["ML model"] = settings.pop("Sample - ML model")
+            settings.pop("Suspect - ML model", None)
         html = report.build(case, "1:1 comparison - sample vs suspect",
                             dict(filename=fq.name, sha256=pq.sha256, minutiae=pq.n, quality=pq.quality,
                                  image=draw_minutiae(pq)),
                             settings,
                             [dict(label=f"{suspect} · {fr.name}" if suspect else fr.name, sha256=pr.sha256,
                                   score=res.score, paired=res.n_paired, supported=res.n_supported, verdict=label,
-                                  colour=colour, image=canvas)],
+                                  colour=colour, image=canvas, ml=ml["ml"] if ml else None)],
                             query_title="Sample fingerprint", ref_title="Suspect fingerprint")
         st.download_button("📄 Download report (HTML)", html, file_name=f"FPMatch_{case['case_no'] or 'case'}_sample_vs_suspect.html",
                            mime="text/html", type="primary")
@@ -222,23 +273,27 @@ elif page == "1:N Search":
         with b:
             if st.button("🔎 Search database", type="primary", disabled=db.count() == 0):
                 bar = st.progress(0.0, "Searching…")
-                hits = db.search(pq.template, top_k=top_k, finger=finger, progress=lambda f: bar.progress(min(f, 1.0)))
+                hits = db.search(pq.template, top_k=top_k, finger=finger, progress=lambda f: bar.progress(min(f, 1.0)),
+                                 query_ml=(pq.enh.enhanced, pq.enh.mask), verifier=VERIFIER)
                 bar.empty()
                 st.session_state["hits"] = (pq.sha256, hits)
                 db.log("search_1toN", case["examiner"], case_no=case["case_no"], query=fq.name,
                        query_sha256=pq.sha256, searched=db.count(), finger=finger,
-                       top=[(h["subject_id"], h["print_id"], round(h["result"].score, 1)) for h in hits[:5]])
+                       top=[(h["subject_id"], h["print_id"], round(h["result"].score, 1),
+                            round(h["ml"]["ml"], 1) if "ml" in h else None) for h in hits[:5]])
             if "hits" in st.session_state and st.session_state["hits"][0] == pq.sha256:
                 hits = st.session_state["hits"][1]
                 rows = []
                 for k, h in enumerate(hits, 1):
-                    lab, col = verdict(h["result"])
+                    lab, col = judge(h["result"], h.get("ml"))
                     rows.append({"Rank": k, "Subject": h["subject_id"], "Name": h["name"], "Finger": h["finger"],
-                                 "Print ID": h["print_id"], "Score": round(h["result"].score, 1),
+                                 "Print ID": h["print_id"],
+                                 "ML score": round(h["ml"]["ml"], 1) if "ml" in h else None,
+                                 "Minutiae score": round(h["result"].score, 1),
                                  "Supported": h["result"].n_supported, "Paired": h["result"].n_paired,
                                  "Indication": lab})
                 st.dataframe(pd.DataFrame(rows), hide_index=True)
-                if hits and verdict(hits[0]["result"])[1] == "gray":
+                if hits and judge(hits[0]["result"], hits[0].get("ml"))[1] == "gray":
                     st.info("No candidate reached the 'possible' band. The source may not be in the database, "
                             "or the questioned print is too limited.")
                 pick = st.selectbox("Inspect candidate", [f"#{r['Rank']} · {r['Subject']} · {r['Finger']}"
@@ -248,13 +303,15 @@ elif page == "1:N Search":
                     ref = db.get(h["print_id"])
                     rgray = db.thumbnail(h["print_id"])
                     canvas = draw_match_arrays(pq.enh.gray, pq.template, rgray, ref["template"], h["result"])
-                    lab, col = verdict(h["result"])
+                    lab, col = judge(h["result"], h.get("ml"))
                     report_rows.append(dict(label=f"{h['subject_id']} {h['name'] or ''} · {h['finger']} · print {h['print_id']}",
                                             sha256=ref["sha256"], score=h["result"].score, paired=h["result"].n_paired,
                                             supported=h["result"].n_supported, verdict=lab, colour=col,
-                                            image=canvas if k <= 5 else None))
+                                            image=canvas if k <= 5 else None, ml=h["ml"]["ml"] if "ml" in h else None))
                     if pick and pick.startswith(f"#{k} "):
-                        verdict_box(h["result"])
+                        verdict_box(h["result"], h.get("ml"))
+                        if "ml" in h:
+                            ml_explainer(h["ml"])
                         st.image(canvas, channels="BGR", width="stretch",
                                  caption="Left: questioned · Right: reference")
                 html = report.build(case, f"1:N search against {db.count()} references (finger: {finger})",
@@ -350,10 +407,35 @@ elif page == "Audit log":
 # ---------------------------------------------------------------------------- help
 else:
     st.header("How to read the results")
+    if VERIFIER.available:
+        st.markdown(f"""
+### ML match score (0-100) - decides the indication
+FP-Match first aligns the two prints with its minutiae matcher. A **neural network** then compares the ridge
+images inside the overlapping area, and a learned **fusion** combines that with the minutiae evidence into the
+ML match score.
+
+| Indication | Rule | Meaning |
+|---|---|---|
+| 🟢 Strong candidate | ML score ≥ {100 * VERIFIER.t_strong:.1f} and the network sees ridge agreement | Prioritise for examiner comparison |
+| 🟠 Possible candidate | ML score ≥ {100 * VERIFIER.t_possible:.1f} | Worth a look, weak evidence |
+| ⚪ Not supported | below, or no usable overlap | The prints do not support a common source |
+
+Model: **{VERIFIER.label}**, ONNX SHA-256 `{VERIFIER.sha256[:16]}…`, trained {VERIFIER.meta.get("created_utc", "")[:10]}.
+{VERIFIER.meta.get("caveat", "")}
+
+The ML score is a similarity score, **not** a probability that the prints share a source.
+""")
+        tm = VERIFIER.meta.get("test_metrics", {})
+        if tm:
+            with st.expander("Model test results (held-out fingers never seen in training)"):
+                st.json(tm, expanded=False)
     st.markdown("""
+### Minutiae score (0-100) - shown for transparency
 **Score (0-100)**: how much of the overlapping area agrees, weighting each paired minutia by how well its
 neighbouring minutiae also agree. **Supported pairs**: paired minutiae whose neighbourhoods agree. Count these
 as corresponding points, not the raw *paired* count.
+
+Without the ML model, these minutiae-only bands decide the indication:
 
 | Indication | Rule | Meaning |
 |---|---|---|
@@ -362,7 +444,8 @@ as corresponding points, not the raw *paired* count.
 | ⚪ Not supported | below both | Minutiae do not support a common source |
 
 These bands were set on a synthetic test set (no impostor exceeded score 17 or 6 supported pairs).
-**Re-check them on your own data** (FVC / SOCOFing / lab prints) using `evaluate.py`.
+**Re-check both methods on your own data** (FVC / SOCOFing / lab prints) using `evaluate.py`, and re-train
+the model on real prints with `training/` before operational use.
 
 **Tips for latent prints**
 * Switch on *Latent / partial print*. Crop to the ridge area so background texture is ignored.
